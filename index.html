@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>째깍 측정 테스트</title>
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 0 auto; padding: 16px; max-width: 520px; background: #111; color: #eee; }
+  button { font: inherit; padding: 14px 20px; border-radius: 10px; border: 0; background: #3b82f6; color: #fff; width: 100%; }
+  button:disabled { background: #444; }
+  canvas { width: 100%; height: 140px; background: #000; border-radius: 8px; margin-top: 12px; }
+  #status { font-size: 22px; font-weight: 700; margin: 12px 0; min-height: 1.4em; }
+  .ok { color: #4ade80; } .bad { color: #f87171; }
+  pre { white-space: pre-wrap; font-size: 13px; color: #aaa; }
+  a { color: #93c5fd; } audio { width: 100%; margin-top: 12px; }
+</style>
+</head>
+<body>
+<h1>째깍 측정 테스트</h1>
+<p>조용한 곳에서 시계 뒷면을 폰 아래쪽 마이크에 바짝 대고 시작을 누르세요. 30초 녹음합니다.</p>
+<button id="start">측정 시작</button>
+<div id="status"></div>
+<canvas id="wave" width="1000" height="280"></canvas>
+<pre id="info"></pre>
+<div id="result"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const SECONDS = 30, KEEP_BINS = 2000;          // 화면·판정에는 최근 2초(1ms 단위)만 사용
+const MIN_LAG = 80, MAX_LAG = 260;             // 째깍 간격 80~260ms = 초당 약 4~12회
+const THRESHOLD = 0.25;                        // 주기성 점수 기준. 실제 시계로 재 보고 조정할 값
+
+let ctx, stream, track, timer, binSize;
+let chunks = [], bins = [], prev = 0, binMax = 0, binCount = 0;
+
+// 최근 2초 포락선에서 "일정한 박자"가 있는지 자기상관으로 확인
+function periodicity(b) {
+  const n = b.length;
+  if (n < MAX_LAG * 3) return { score: 0, lag: 0 };
+  const mean = b.reduce((a, v) => a + v, 0) / n;
+  const v = b.map(x => x - mean);
+  const r0 = v.reduce((a, x) => a + x * x, 0) || 1;
+  let best = { score: 0, lag: 0 };
+  for (let lag = MIN_LAG; lag <= MAX_LAG; lag++) {
+    let r = 0;
+    for (let i = 0; i + lag < n; i++) r += v[i] * v[i + lag];
+    if (r / r0 > best.score) best = { score: r / r0, lag };
+  }
+  return best;
+}
+
+function draw() {
+  const c = $('wave'), g = c.getContext('2d');
+  g.clearRect(0, 0, c.width, c.height);
+  const max = Math.max(...bins, 1e-9);
+  g.fillStyle = '#4ade80';
+  bins.forEach((b, i) => {
+    const h = b / max * c.height;
+    g.fillRect(i / KEEP_BINS * c.width, c.height - h, 1, h);
+  });
+}
+
+function tick() {
+  draw();
+  const p = periodicity(bins);
+  const left = Math.max(0, SECONDS - chunks.length * 4096 / ctx.sampleRate);
+  const found = p.score >= THRESHOLD;
+  $('status').className = found ? 'ok' : 'bad';
+  $('status').textContent = found
+    ? `째깍 감지됨 · 초당 약 ${(1000 / p.lag).toFixed(1)}회`
+    : '째깍이 안 잡힘 · 더 가까이 대 보세요';
+  $('info').textContent = `남은 시간 ${left.toFixed(0)}초 · 주기성 점수 ${p.score.toFixed(2)} (기준 ${THRESHOLD})`;
+  if (left <= 0) finish(p);
+}
+
+function toWav(samples, rate) {
+  let peak = 1e-9;
+  for (const s of samples) peak = Math.max(peak, Math.abs(s));
+  const buf = new ArrayBuffer(44 + samples.length * 2), d = new DataView(buf);
+  const str = (o, s) => [...s].forEach((ch, i) => d.setUint8(o + i, ch.charCodeAt(0)));
+  str(0, 'RIFF'); d.setUint32(4, 36 + samples.length * 2, true); str(8, 'WAVEfmt ');
+  d.setUint32(16, 16, true); d.setUint16(20, 1, true); d.setUint16(22, 1, true);
+  d.setUint32(24, rate, true); d.setUint32(28, rate * 2, true);
+  d.setUint16(32, 2, true); d.setUint16(34, 16, true);
+  str(36, 'data'); d.setUint32(40, samples.length * 2, true);
+  // 작은 소리가 16비트에서 뭉개지지 않게 최대값 기준으로 키워서 저장 (시점 정보는 그대로)
+  samples.forEach((s, i) => d.setInt16(44 + i * 2, s / peak * 0.9 * 32767, true));
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+function finish(p) {
+  clearInterval(timer);
+  const settings = track.getSettings();
+  stream.getTracks().forEach(t => t.stop());
+  const all = new Float32Array(chunks.length * 4096);
+  chunks.forEach((c, i) => all.set(c, i * 4096));
+  const url = URL.createObjectURL(toWav(all, ctx.sampleRate));
+  ctx.close();
+  $('info').textContent =
+    `최종 주기성 점수 ${p.score.toFixed(2)} (기준 ${THRESHOLD})\n` +
+    `녹음 주파수 ${ctx.sampleRate}Hz\n` +
+    `브라우저가 실제 적용한 설정:\n` +
+    `  울림 제거 ${settings.echoCancellation}\n  소음 제거 ${settings.noiseSuppression}\n  자동 음량 ${settings.autoGainControl}`;
+  $('result').innerHTML = `<audio controls src="${url}"></audio><p><a href="${url}" download="tick-test.wav">녹음 파일(WAV) 저장</a></p>`;
+  $('start').disabled = false;
+}
+
+$('start').onclick = async () => {
+  $('start').disabled = true;
+  $('result').innerHTML = '';
+  chunks = []; bins = []; prev = 0; binMax = 0; binCount = 0;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+    });
+  } catch (e) {
+    $('status').className = 'bad';
+    $('status').textContent = '마이크를 쓸 수 없습니다: ' + e.message;
+    $('start').disabled = false;
+    return;
+  }
+  track = stream.getAudioTracks()[0];
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  binSize = Math.round(ctx.sampleRate / 1000);
+  const src = ctx.createMediaStreamSource(stream);
+  // ponytail: ScriptProcessor는 폐기 예정이지만 파일 하나로 아이폰 사파리에서 동작. 실제 앱에서는 AudioWorklet으로 교체
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  proc.onaudioprocess = e => {
+    const x = e.inputBuffer.getChannelData(0);
+    chunks.push(new Float32Array(x));
+    for (let i = 0; i < x.length; i++) {
+      // 앞 표본과의 차이를 써서 낮은 소리(웅웅거림)는 줄이고 째깍 같은 날카로운 소리만 남김
+      const dlt = Math.abs(x[i] - prev); prev = x[i];
+      if (dlt > binMax) binMax = dlt;
+      if (++binCount === binSize) { bins.push(binMax); binMax = 0; binCount = 0; }
+    }
+    if (bins.length > KEEP_BINS) bins.splice(0, bins.length - KEEP_BINS);
+  };
+  const mute = ctx.createGain(); mute.gain.value = 0;   // 스피커로 되울리지 않게
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  timer = setInterval(tick, 250);
+};
+</script>
+</body>
+</html>
